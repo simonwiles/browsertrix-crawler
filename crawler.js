@@ -30,7 +30,7 @@ const { ScreenCaster, WSTransport, RedisPubSubTransport } = require("./util/scre
 const { parseArgs } = require("./util/argParser");
 const { initRedis } = require("./util/redis");
 
-const { getBrowserExe, loadProfile, evaluateWithCLI } = require("./util/browser");
+const { getBrowserExe, loadProfile, chromeArgs, getDefaultUA, evaluateWithCLI } = require("./util/browser");
 
 const { BEHAVIOR_LOG_FUNC, HTML_TYPES, DEFAULT_SELECTORS } = require("./util/constants");
 
@@ -57,9 +57,11 @@ class Crawler {
     this.params = res.parsed;
     this.origConfig = res.origConfig;
 
-    this.debugLogging = this.params.logging.includes("debug");
+    this.saveStateFiles = [];
+    this.lastSaveTime = 0;
+    this.saveStateInterval = this.params.saveStateInterval * 1000;
 
-    this.profileDir = loadProfile(this.params.profile);
+    this.debugLogging = this.params.logging.includes("debug");
 
     if (this.params.profile) {
       this.statusLog("With Browser Profile: " + this.params.profile);
@@ -111,22 +113,11 @@ class Crawler {
       return;
     }
 
-    this.browserExe = getBrowserExe();
-
     // if device set, it overrides the default Chrome UA
     if (this.emulateDevice) {
       this.userAgent = this.emulateDevice.userAgent;
     } else {
-      let version = process.env.BROWSER_VERSION;
-
-      try {
-        version = child_process.execFileSync(this.browserExe, ["--version"], {encoding: "utf8"});
-        version = version.match(/[\d.]+/)[0];
-      } catch(e) {
-        console.error(e);
-      }
-
-      this.userAgent = `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version} Safari/537.36`;
+      this.userAgent = getDefaultUA();
     }
 
     // suffix to append to default userAgent
@@ -165,6 +156,10 @@ class Crawler {
       this.crawlState = new MemoryCrawlState();
     }
 
+    if (this.params.saveState === "always" && this.params.saveStateInterval) {
+      this.statusLog(`Saving crawl state every ${this.params.saveStateInterval} seconds, keeping last ${this.params.saveStateHistory} states`);
+    }
+
     return this.crawlState;
   }
 
@@ -195,6 +190,8 @@ class Crawler {
     else{
       opts = {stdio: "ignore", cwd: this.params.cwd};
     }
+
+    this.browserExe = getBrowserExe();
 
     this.configureUA();
 
@@ -231,21 +228,6 @@ class Crawler {
     }
   }
 
-  get chromeArgs() {
-    // Chrome Flags, including proxy server
-    return [
-      ...(process.env.CHROME_FLAGS ?? "").split(" ").filter(Boolean),
-      "--no-xshm", // needed for Chrome >80 (check if puppeteer adds automatically)
-      `--proxy-server=http://${process.env.PROXY_HOST}:${process.env.PROXY_PORT}`,
-      "--no-sandbox",
-      "--disable-background-media-suspend",
-      "--autoplay-policy=no-user-gesture-required",
-      "--disable-features=IsolateOrigins,site-per-process",
-      "--disable-popup-blocking",
-      "--disable-backgrounding-occluded-windows",
-    ];
-  }
-
   get puppeteerArgs() {
     // Puppeter Options
     return {
@@ -255,7 +237,7 @@ class Crawler {
       handleSIGTERM: false,
       handleSIGHUP: false,
       ignoreHTTPSErrors: true,
-      args: this.chromeArgs,
+      args: chromeArgs(true, this.userAgent),
       userDataDir: this.profileDir,
       defaultViewport: null,
     };
@@ -304,6 +286,8 @@ class Crawler {
         await page._client.send("Network.setBypassServiceWorker", {bypass: true});
       }
 
+      await page.evaluateOnNewDocument("Object.defineProperty(navigator, \"webdriver\", {value: false});");
+
       if (this.params.behaviorOpts && !page.__bx_inited) {
         await page.exposeFunction(BEHAVIOR_LOG_FUNC, (logdata) => this._behaviorLog(logdata));
         await page.evaluateOnNewDocument(behaviors + `;\nself.__bx_behaviors.init(${this.params.behaviorOpts});`);
@@ -321,13 +305,15 @@ class Crawler {
         text = await new TextExtract(result).parseTextFromDom();
       }
 
-      await this.writePage(data, title, this.params.text, text);
+      await this.writePage(data, title, this.params.text ? text : null);
 
       if (this.params.behaviorOpts) {
         await Promise.allSettled(page.frames().map(frame => evaluateWithCLI(frame, "self.__bx_behaviors.run();")));
       }
 
       await this.writeStats();
+
+      await this.serializeConfig();
 
     } catch (e) {
       console.warn(e);
@@ -362,6 +348,7 @@ class Crawler {
   }
 
   async crawl() {
+    this.profileDir = await loadProfile(this.params.profile);
 
     try {
       this.driver = require(this.params.driver);
@@ -433,7 +420,7 @@ class Crawler {
     await this.cluster.idle();
     await this.cluster.close();
 
-    await this.serializeConfig();
+    await this.serializeConfig(true);
 
     this.writeStats();
 
@@ -541,8 +528,9 @@ class Crawler {
 
     if (!await this.isHTML(url)) {
       try {
-        await this.directFetchCapture(url);
-        return;
+        if (await this.directFetchCapture(url)) {
+          return;
+        }
       } catch (e) {
         // ignore failed direct fetch attempt, do browser-based capture
       }
@@ -552,13 +540,26 @@ class Crawler {
       await this.blockRules.initPage(page);
     }
 
+    let ignoreAbort = false;
+
+    // Detect if ERR_ABORTED is actually caused by trying to load a non-page (eg. downloadable PDF),
+    // if so, don't report as an error
+    page.on("requestfailed", (req) => {
+      ignoreAbort = shouldIgnoreAbort(req);
+    });
+
     try {
       await page.goto(url, this.gotoOpts);
     } catch (e) {
-      console.warn(`Load timeout for ${url}`, e);
+      let msg = e.message || "";
+      if (!msg.startsWith("net::ERR_ABORTED") || !ignoreAbort) {
+        this.statusLog(`ERROR: ${url}: ${msg}`);
+      }
     }
 
     const seed = this.params.scopedSeeds[seedId];
+
+    await this.checkCF(page);
 
     // skip extraction if at max depth
     if (seed.isAtMaxDepth(depth) || !selectorOptsList) {
@@ -628,6 +629,17 @@ class Crawler {
     }
   }
 
+  async checkCF(page) {
+    try {
+      while (await page.$("div.cf-browser-verification.cf-im-under-attack")) {
+        this.statusLog("Cloudflare Check Detected, waiting for reload...");
+        await this.sleep(5500);
+      }
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+
   async queueUrl(seedId, url, depth, extraHops = 0) {
     if (this.limitHit) {
       return false;
@@ -681,7 +693,7 @@ class Crawler {
     }
   }
 
-  async writePage({url, depth}, title, text, text_content) {
+  async writePage({url, depth}, title, text) {
     const id = uuidv4();
     const row = {"id": id, "url": url, "title": title};
 
@@ -689,15 +701,14 @@ class Crawler {
       row.seed = true;
     }
 
-    if (text) {
-      row.text = text_content;
+    if (text !== null) {
+      row.text = text;
     }
 
-    const processedRow = JSON.stringify(row).concat("\n");
+    const processedRow = JSON.stringify(row) + "\n";
     try {
-      this.pagesFH.writeFile(processedRow);
-    }
-    catch (err) {
+      await this.pagesFH.writeFile(processedRow);
+    } catch (err) {
       console.warn("pages/pages.jsonl append failed", err);
     }
   }
@@ -713,7 +724,7 @@ class Crawler {
         headers: this.headers,
         agent: this.resolveAgent
       });
-      if (resp.status >= 400) {
+      if (resp.status !== 200) {
         this.debugLog(`Skipping HEAD check ${url}, invalid status ${resp.status}`);
         return true;
       }
@@ -742,8 +753,9 @@ class Crawler {
     //console.log(`Direct capture: ${this.capturePrefix}${url}`);
     const abort = new AbortController();
     const signal = abort.signal;
-    await fetch(this.capturePrefix + url, {signal, headers: this.headers});
+    const resp = await fetch(this.capturePrefix + url, {signal, headers: this.headers, redirect: "manual"});
     abort.abort();
+    return resp.status === 200 && !resp.headers.get("set-cookie");
   }
 
   async awaitPendingClear() {
@@ -875,12 +887,15 @@ class Crawler {
     this.debugLog(`Combined WARCs saved as: ${generatedCombinedWarcs}`);
   }
 
-  async serializeConfig() {
+  async serializeConfig(done = false) {
     switch (this.params.saveState) {
     case "never":
       return;
 
     case "partial":
+      if (!done) {
+        return;
+      }
       if (await this.crawlState.finished()) {
         return;
       }
@@ -891,7 +906,18 @@ class Crawler {
       break;
     }
 
-    const ts = new Date().toISOString().slice(0,19).replace(/[T:-]/g, "");
+    const now = new Date();
+
+    if (!done) {
+      // if not done, save state only after specified interval has elapsed
+      if ((now.getTime() - this.lastSaveTime) < this.saveStateInterval) {
+        return;
+      }
+    }
+
+    this.lastSaveTime = now.getTime();
+
+    const ts = now.toISOString().slice(0,19).replace(/[T:-]/g, "");
 
     const crawlDir = path.join(this.collDir, "crawls");
 
@@ -899,15 +925,54 @@ class Crawler {
 
     const filename = path.join(crawlDir, `crawl-${ts}-${this.params.crawlId}.yaml`);
 
-    this.statusLog("Saving crawl state to: " + filename);
-
     const state = await this.crawlState.serialize();
 
     if (this.origConfig) {
       this.origConfig.state = state;
     }
     const res = yaml.dump(this.origConfig, {lineWidth: -1});
-    fs.writeFileSync(filename, res);
+    try {
+      this.statusLog("Saving crawl state to: " + filename);
+      await fsp.writeFile(filename, res);
+    } catch (e) {
+      console.error(`Failed to write save state file: ${filename}`, e);
+      return;
+    }
+
+    this.saveStateFiles.push(filename);
+
+    if (this.saveStateFiles.length > this.params.saveStateHistory) {
+      const oldFilename = this.saveStateFiles.shift();
+      this.statusLog(`Removing old save-state: ${oldFilename}`);
+      try {
+        await fsp.unlink(oldFilename);
+      } catch (e) {
+        console.error(`Failed to delete old save state file: ${oldFilename}`);
+      }
+    }
+  }
+}
+
+function shouldIgnoreAbort(req) {
+  try {
+    const failure = req.failure() && req.failure().errorText;
+    if (failure !== "net::ERR_ABORTED" || req.resourceType() !== "document") {
+      return false;
+    }
+
+    const resp = req.response();
+    const headers = resp && resp.headers();
+
+    if (!headers) {
+      return false;
+    }
+
+    if (headers["content-disposition"] || 
+       (headers["content-type"] && !headers["content-type"].startsWith("text/"))) {
+      return true;
+    }
+  } catch (e) {
+    return false;
   }
 }
 
